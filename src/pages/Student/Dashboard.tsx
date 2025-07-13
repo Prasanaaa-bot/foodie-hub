@@ -80,43 +80,13 @@ const StudentDashboard: React.FC = () => {
 
   const fetchMenuItems = async () => {
     try {
-      // First get all menu items
       const { data, error } = await supabase
         .from('menu_items')
         .select('*');
 
       if (error) throw error;
       
-      if (!data) {
-        setMenuItems([]);
-        return;
-      }
-
-      // Get all cart items to calculate reserved quantities
-      const { data: allCartItems, error: cartError } = await supabase
-        .from('cart_items')
-        .select('menu_item_id, quantity');
-
-      if (cartError) {
-        console.error('Error fetching cart items for availability calculation:', cartError);
-        setMenuItems(data);
-        return;
-      }
-
-      // Calculate reserved quantities for each menu item
-      const reservedQuantities = new Map<string, number>();
-      allCartItems?.forEach(cartItem => {
-        const current = reservedQuantities.get(cartItem.menu_item_id) || 0;
-        reservedQuantities.set(cartItem.menu_item_id, current + cartItem.quantity);
-      });
-
-      // Update menu items with actual available quantities (total - reserved)
-      const updatedMenuItems = data.map(item => ({
-        ...item,
-        quantity_available: Math.max(0, item.quantity_available - (reservedQuantities.get(item.id) || 0))
-      }));
-
-      setMenuItems(updatedMenuItems);
+      setMenuItems(data || []);
     } catch (error) {
       console.error('Error fetching menu items:', error);
       showToast('Failed to load menu items', 'error');
@@ -176,12 +146,6 @@ const StudentDashboard: React.FC = () => {
       const existingItem = cartItems.find(item => item.menu_item_id === menuItem.id);
 
       if (existingItem) {
-        // Check if we can add more (don't exceed available quantity)
-        if (existingItem.quantity >= menuItem.quantity_available) {
-          showToast('Cannot add more items. Stock limit reached.', 'error');
-          return;
-        }
-
         // Update cart quantity
         const { error: cartError } = await supabase
           .from('cart_items')
@@ -189,6 +153,14 @@ const StudentDashboard: React.FC = () => {
           .eq('id', existingItem.id);
 
         if (cartError) throw cartError;
+
+        // Immediately reduce the menu item quantity in database
+        const { error: menuError } = await supabase
+          .from('menu_items')
+          .update({ quantity_available: menuItem.quantity_available - 1 })
+          .eq('id', menuItem.id);
+
+        if (menuError) throw menuError;
       } else {
         // Insert new cart item
         const { error: insertError } = await supabase
@@ -200,11 +172,17 @@ const StudentDashboard: React.FC = () => {
           });
 
         if (insertError) throw insertError;
+
+        // Immediately reduce the menu item quantity in database
+        const { error: menuError } = await supabase
+          .from('menu_items')
+          .update({ quantity_available: menuItem.quantity_available - 1 })
+          .eq('id', menuItem.id);
+
+        if (menuError) throw menuError;
       }
 
-      // Refresh cart items first
       await fetchCartItems();
-      // Then refresh menu items to get updated quantities
       await fetchMenuItems();
       showToast('Item added to cart', 'success');
     } catch (error) {
@@ -219,41 +197,23 @@ const StudentDashboard: React.FC = () => {
       return;
     }
 
-    // Find the cart item to get current quantity and menu item details
     const cartItem = cartItems.find(item => item.id === cartItemId);
     if (!cartItem) {
       showToast('Cart item not found', 'error');
       return;
     }
 
-    // Get the current menu item to check available stock
     const currentMenuItem = menuItems.find(item => item.id === cartItem.menu_item_id);
     if (!currentMenuItem) {
       showToast('Menu item not found', 'error');
       return;
     }
 
-    // Calculate total items in cart for this menu item (including other users)
-    const { data: allCartItems, error: cartCheckError } = await supabase
-      .from('cart_items')
-      .select('quantity')
-      .eq('menu_item_id', cartItem.menu_item_id);
-
-    if (cartCheckError) {
-      console.error('Error checking cart items:', cartCheckError);
-      showToast('Failed to check availability', 'error');
-      return;
-    }
-
-    const totalInAllCarts = allCartItems?.reduce((sum, item) => sum + item.quantity, 0) || 0;
-    const currentUserCartQuantity = cartItem.quantity;
-    const otherUsersCartQuantity = totalInAllCarts - currentUserCartQuantity;
+    const quantityDifference = newQuantity - cartItem.quantity;
     
-    // Check if the new quantity would exceed available stock
-    const availableForThisUser = currentMenuItem.quantity_available + currentUserCartQuantity;
-    
-    if (newQuantity > availableForThisUser) {
-      showToast(`Only ${availableForThisUser} items available`, 'error');
+    // Check if we're trying to add more items than available
+    if (quantityDifference > 0 && quantityDifference > currentMenuItem.quantity_available) {
+      showToast(`Only ${currentMenuItem.quantity_available} more items available`, 'error');
       return;
     }
 
@@ -266,9 +226,16 @@ const StudentDashboard: React.FC = () => {
 
       if (cartError) throw cartError;
 
-      // Refresh cart items first
+      // Update menu item quantity based on the difference
+      const newMenuQuantity = currentMenuItem.quantity_available - quantityDifference;
+      const { error: menuError } = await supabase
+        .from('menu_items')
+        .update({ quantity_available: Math.max(0, newMenuQuantity) })
+        .eq('id', cartItem.menu_item_id);
+
+      if (menuError) throw menuError;
+
       await fetchCartItems();
-      // Then refresh menu items
       await fetchMenuItems();
     } catch (error) {
       console.error('Error updating cart quantity:', error);
@@ -277,6 +244,12 @@ const StudentDashboard: React.FC = () => {
   };
 
   const removeFromCart = async (cartItemId: string) => {
+    const cartItem = cartItems.find(item => item.id === cartItemId);
+    if (!cartItem) {
+      showToast('Cart item not found', 'error');
+      return;
+    }
+
     try {
       // Remove from cart
       const { error } = await supabase
@@ -286,9 +259,17 @@ const StudentDashboard: React.FC = () => {
 
       if (error) throw error;
 
-      // Refresh cart items first
+      // Return the quantity back to menu item
+      const { error: menuError } = await supabase
+        .from('menu_items')
+        .update({ 
+          quantity_available: cartItem.menu_items.quantity_available + cartItem.quantity 
+        })
+        .eq('id', cartItem.menu_item_id);
+
+      if (menuError) throw menuError;
+
       await fetchCartItems();
-      // Then refresh menu items
       await fetchMenuItems();
       showToast('Item removed from cart', 'success');
     } catch (error) {
@@ -338,21 +319,6 @@ const StudentDashboard: React.FC = () => {
 
       if (itemsError) throw itemsError;
 
-      // Update menu item quantities by reducing the ordered amounts
-      for (const cartItem of cartItems) {
-        const { error: updateError } = await supabase
-          .from('menu_items')
-          .update({ 
-            quantity_available: cartItem.menu_items.quantity_available - cartItem.quantity 
-          })
-          .eq('id', cartItem.menu_item_id);
-
-        if (updateError) {
-          console.error('Error updating menu item quantity:', updateError);
-          // Continue with other items even if one fails
-        }
-      }
-
       // Clear cart after successful order placement
       const { error: clearCartError } = await supabase
         .from('cart_items')
@@ -361,7 +327,6 @@ const StudentDashboard: React.FC = () => {
 
       if (clearCartError) throw clearCartError;
 
-      // Refresh all data
       await fetchCartItems();
       await fetchOrders();
       await fetchMenuItems();
