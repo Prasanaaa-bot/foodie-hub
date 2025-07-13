@@ -82,7 +82,8 @@ const StudentDashboard: React.FC = () => {
     try {
       const { data, error } = await supabase
         .from('menu_items')
-        .select('*');
+        .select('*')
+        .order('name');
 
       if (error) throw error;
       
@@ -146,7 +147,7 @@ const StudentDashboard: React.FC = () => {
       const existingItem = cartItems.find(item => item.menu_item_id === menuItem.id);
 
       if (existingItem) {
-        // Update cart quantity
+        // Update cart quantity and reduce menu item stock
         const { error: cartError } = await supabase
           .from('cart_items')
           .update({ quantity: existingItem.quantity + 1 })
@@ -162,7 +163,7 @@ const StudentDashboard: React.FC = () => {
 
         if (menuError) throw menuError;
       } else {
-        // Insert new cart item
+        // Insert new cart item and reduce menu item stock
         const { error: insertError } = await supabase
           .from('cart_items')
           .insert({
@@ -182,6 +183,7 @@ const StudentDashboard: React.FC = () => {
         if (menuError) throw menuError;
       }
 
+      // Refresh both cart and menu items to reflect changes
       await fetchCartItems();
       await fetchMenuItems();
       showToast('Item added to cart', 'success');
@@ -203,8 +205,14 @@ const StudentDashboard: React.FC = () => {
       return;
     }
 
-    const currentMenuItem = menuItems.find(item => item.id === cartItem.menu_item_id);
-    if (!currentMenuItem) {
+    // Get current menu item data from database to ensure accuracy
+    const { data: currentMenuItem, error: fetchError } = await supabase
+      .from('menu_items')
+      .select('*')
+      .eq('id', cartItem.menu_item_id)
+      .single();
+
+    if (fetchError || !currentMenuItem) {
       showToast('Menu item not found', 'error');
       return;
     }
@@ -226,17 +234,19 @@ const StudentDashboard: React.FC = () => {
 
       if (cartError) throw cartError;
 
-      // Update menu item quantity based on the difference
+      // Update menu item quantity in database based on the difference
       const newMenuQuantity = currentMenuItem.quantity_available - quantityDifference;
       const { error: menuError } = await supabase
         .from('menu_items')
         .update({ quantity_available: Math.max(0, newMenuQuantity) })
-        .eq('id', cartItem.menu_item_id);
+        .eq('id', currentMenuItem.id);
 
       if (menuError) throw menuError;
 
+      // Refresh both cart and menu items to reflect changes
       await fetchCartItems();
       await fetchMenuItems();
+      showToast('Cart updated successfully', 'success');
     } catch (error) {
       console.error('Error updating cart quantity:', error);
       showToast('Failed to update quantity', 'error');
@@ -251,6 +261,18 @@ const StudentDashboard: React.FC = () => {
     }
 
     try {
+      // Get current menu item data from database
+      const { data: currentMenuItem, error: fetchError } = await supabase
+        .from('menu_items')
+        .select('*')
+        .eq('id', cartItem.menu_item_id)
+        .single();
+
+      if (fetchError || !currentMenuItem) {
+        showToast('Menu item not found', 'error');
+        return;
+      }
+
       // Remove from cart
       const { error } = await supabase
         .from('cart_items')
@@ -259,16 +281,17 @@ const StudentDashboard: React.FC = () => {
 
       if (error) throw error;
 
-      // Return the quantity back to menu item
+      // Return the quantity back to menu item in database
       const { error: menuError } = await supabase
         .from('menu_items')
         .update({ 
-          quantity_available: cartItem.menu_items.quantity_available + cartItem.quantity 
+          quantity_available: currentMenuItem.quantity_available + cartItem.quantity 
         })
         .eq('id', cartItem.menu_item_id);
 
       if (menuError) throw menuError;
 
+      // Refresh both cart and menu items to reflect changes
       await fetchCartItems();
       await fetchMenuItems();
       showToast('Item removed from cart', 'success');
@@ -319,7 +342,7 @@ const StudentDashboard: React.FC = () => {
 
       if (itemsError) throw itemsError;
 
-      // Clear cart after successful order placement
+      // Clear cart after successful order placement (quantities already deducted)
       const { error: clearCartError } = await supabase
         .from('cart_items')
         .delete()
@@ -327,6 +350,7 @@ const StudentDashboard: React.FC = () => {
 
       if (clearCartError) throw clearCartError;
 
+      // Refresh all data to reflect changes
       await fetchCartItems();
       await fetchOrders();
       await fetchMenuItems();
