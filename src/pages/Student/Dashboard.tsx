@@ -80,13 +80,43 @@ const StudentDashboard: React.FC = () => {
 
   const fetchMenuItems = async () => {
     try {
+      // First get all menu items
       const { data, error } = await supabase
         .from('menu_items')
-        .select('*')
-        .gt('quantity_available', 0);
+        .select('*');
 
       if (error) throw error;
-      setMenuItems(data || []);
+      
+      if (!data) {
+        setMenuItems([]);
+        return;
+      }
+
+      // Get all cart items to calculate reserved quantities
+      const { data: allCartItems, error: cartError } = await supabase
+        .from('cart_items')
+        .select('menu_item_id, quantity');
+
+      if (cartError) {
+        console.error('Error fetching cart items for availability calculation:', cartError);
+        setMenuItems(data);
+        return;
+      }
+
+      // Calculate reserved quantities for each menu item
+      const reservedQuantities = new Map<string, number>();
+      allCartItems?.forEach(cartItem => {
+        const current = reservedQuantities.get(cartItem.menu_item_id) || 0;
+        reservedQuantities.set(cartItem.menu_item_id, current + cartItem.quantity);
+      });
+
+      // Update menu items with actual available quantities (total - reserved)
+      const updatedMenuItems = data.map(item => ({
+        ...item,
+        quantity_available: Math.max(0, item.quantity_available - (reservedQuantities.get(item.id) || 0))
+      }));
+
+      setMenuItems(updatedMenuItems);
     } catch (error) {
       console.error('Error fetching menu items:', error);
       showToast('Failed to load menu items', 'error');
@@ -172,16 +202,9 @@ const StudentDashboard: React.FC = () => {
         if (insertError) throw insertError;
       }
 
-      // Update the menu item quantity in the database
-      const { error: updateError } = await supabase
-        .from('menu_items')
-        .update({ quantity_available: menuItem.quantity_available - 1 })
-        .eq('id', menuItem.id);
-
-      if (updateError) throw updateError;
-
-      // Refresh both cart and menu items to reflect changes
+      // Refresh cart items first
       await fetchCartItems();
+      // Then refresh menu items to get updated quantities
       await fetchMenuItems();
       showToast('Item added to cart', 'success');
     } catch (error) {
@@ -203,15 +226,35 @@ const StudentDashboard: React.FC = () => {
       return;
     }
 
-    const quantityDifference = newQuantity - cartItem.quantity;
+    // Get the current menu item to check available stock
+    const currentMenuItem = menuItems.find(item => item.id === cartItem.menu_item_id);
+    if (!currentMenuItem) {
+      showToast('Menu item not found', 'error');
+      return;
+    }
+
+    // Calculate total items in cart for this menu item (including other users)
+    const { data: allCartItems, error: cartCheckError } = await supabase
+      .from('cart_items')
+      .select('quantity')
+      .eq('menu_item_id', cartItem.menu_item_id);
+
+    if (cartCheckError) {
+      console.error('Error checking cart items:', cartCheckError);
+      showToast('Failed to check availability', 'error');
+      return;
+    }
+
+    const totalInAllCarts = allCartItems?.reduce((sum, item) => sum + item.quantity, 0) || 0;
+    const currentUserCartQuantity = cartItem.quantity;
+    const otherUsersCartQuantity = totalInAllCarts - currentUserCartQuantity;
     
-    // If increasing quantity, check if enough stock is available
-    if (quantityDifference > 0) {
-      const menuItem = cartItem.menu_items;
-      if (quantityDifference > menuItem.quantity_available) {
-        showToast('Not enough stock available', 'error');
-        return;
-      }
+    // Check if the new quantity would exceed available stock
+    const availableForThisUser = currentMenuItem.quantity_available + currentUserCartQuantity;
+    
+    if (newQuantity > availableForThisUser) {
+      showToast(`Only ${availableForThisUser} items available`, 'error');
+      return;
     }
 
     try {
@@ -223,18 +266,9 @@ const StudentDashboard: React.FC = () => {
 
       if (cartError) throw cartError;
 
-      // Update menu item quantity (subtract the difference from available stock)
-      const { error: updateError } = await supabase
-        .from('menu_items')
-        .update({ 
-          quantity_available: cartItem.menu_items.quantity_available - quantityDifference 
-        })
-        .eq('id', cartItem.menu_item_id);
-
-      if (updateError) throw updateError;
-
-      // Refresh both cart and menu items
+      // Refresh cart items first
       await fetchCartItems();
+      // Then refresh menu items
       await fetchMenuItems();
     } catch (error) {
       console.error('Error updating cart quantity:', error);
@@ -243,13 +277,6 @@ const StudentDashboard: React.FC = () => {
   };
 
   const removeFromCart = async (cartItemId: string) => {
-    // Find the cart item to restore quantity to menu item
-    const cartItem = cartItems.find(item => item.id === cartItemId);
-    if (!cartItem) {
-      showToast('Cart item not found', 'error');
-      return;
-    }
-
     try {
       // Remove from cart
       const { error } = await supabase
@@ -259,18 +286,9 @@ const StudentDashboard: React.FC = () => {
 
       if (error) throw error;
 
-      // Restore quantity to menu item
-      const { error: updateError } = await supabase
-        .from('menu_items')
-        .update({ 
-          quantity_available: cartItem.menu_items.quantity_available + cartItem.quantity 
-        })
-        .eq('id', cartItem.menu_item_id);
-
-      if (updateError) throw updateError;
-
-      // Refresh both cart and menu items
+      // Refresh cart items first
       await fetchCartItems();
+      // Then refresh menu items
       await fetchMenuItems();
       showToast('Item removed from cart', 'success');
     } catch (error) {
@@ -286,12 +304,13 @@ const StudentDashboard: React.FC = () => {
     }
 
     try {
-      // Update cart quantity
+      // Calculate total amount
       const totalAmount = cartItems.reduce(
         (sum, item) => sum + (item.menu_items.price * item.quantity),
         0
       );
 
+      // Create the order
       const { data: order, error: orderError } = await supabase
         .from('orders')
         .insert({
@@ -305,6 +324,7 @@ const StudentDashboard: React.FC = () => {
 
       if (orderError) throw orderError;
 
+      // Create order items
       const orderItems = cartItems.map(item => ({
         order_id: order.id,
         menu_item_id: item.menu_item_id,
@@ -318,7 +338,22 @@ const StudentDashboard: React.FC = () => {
 
       if (itemsError) throw itemsError;
 
-      // Clear cart (this will not restore quantities since order is placed)
+      // Update menu item quantities by reducing the ordered amounts
+      for (const cartItem of cartItems) {
+        const { error: updateError } = await supabase
+          .from('menu_items')
+          .update({ 
+            quantity_available: cartItem.menu_items.quantity_available - cartItem.quantity 
+          })
+          .eq('id', cartItem.menu_item_id);
+
+        if (updateError) {
+          console.error('Error updating menu item quantity:', updateError);
+          // Continue with other items even if one fails
+        }
+      }
+
+      // Clear cart after successful order placement
       const { error: clearCartError } = await supabase
         .from('cart_items')
         .delete()
@@ -326,10 +361,10 @@ const StudentDashboard: React.FC = () => {
 
       if (clearCartError) throw clearCartError;
 
-      // Refresh both cart and menu items
+      // Refresh all data
       await fetchCartItems();
       await fetchOrders();
-      await fetchMenuItems(); // Refresh menu to show updated quantities
+      await fetchMenuItems();
       setActiveTab('orders');
       showToast('Order placed successfully!', 'success');
     } catch (error) {
@@ -496,6 +531,14 @@ const StudentDashboard: React.FC = () => {
                       <Star className="w-3 h-3 text-yellow-400 fill-current" />
                       <span className="text-sm font-medium">{item.rating}</span>
                     </div>
+                    {/* Out of stock overlay */}
+                    {item.quantity_available <= 0 && (
+                      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center">
+                        <div className="bg-red-500 text-white px-4 py-2 rounded-lg font-semibold">
+                          Out of Stock
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <div className="p-4 flex flex-col flex-grow">
                     <div className="flex justify-between items-start mb-2">
@@ -508,7 +551,15 @@ const StudentDashboard: React.FC = () => {
                     <div className="mt-auto space-y-3">
                       {/* Available and Serves on same line */}
                       <div className="flex items-center justify-between">
-                        <span className="text-sm text-green-600 dark:text-green-400 font-medium">Available: {item.quantity_available}</span>
+                        <span className={`text-sm font-medium ${
+                          item.quantity_available <= 0 
+                            ? 'text-red-600 dark:text-red-400' 
+                            : item.quantity_available <= 5 
+                            ? 'text-yellow-600 dark:text-yellow-400' 
+                            : 'text-green-600 dark:text-green-400'
+                        }`}>
+                          Available: {item.quantity_available}
+                        </span>
                         <span className="text-sm text-gray-500 dark:text-gray-400">Serves {item.serves}</span>
                       </div>
                       <div className="flex items-center justify-between">
@@ -516,7 +567,11 @@ const StudentDashboard: React.FC = () => {
                         <button
                           onClick={() => addToCart(item)}
                           disabled={item.quantity_available <= 0}
-                          className="bg-orange-500 hover:bg-orange-600 disabled:bg-gray-400 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg transition-colors flex items-center space-x-2"
+                          className={`px-4 py-2 rounded-lg transition-colors flex items-center space-x-2 text-white font-medium ${
+                            item.quantity_available <= 0
+                              ? 'bg-gray-400 cursor-not-allowed'
+                              : 'bg-orange-500 hover:bg-orange-600'
+                          }`}
                         >
                           <Plus className="w-4 h-4" />
                           <span>{item.quantity_available <= 0 ? 'Out of Stock' : 'Add'}</span>
